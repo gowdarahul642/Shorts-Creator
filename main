@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""
+==================================================
+  Owl Learner — German YouTube Bot v10
+  NEW: Dynamic comment prompt segment (SEG 7)
+  FIXED: Audio sync via consistent WAV resampling
+==================================================
+INSTALL:
+    pip install pyttsx3 edge-tts gtts google-api-python-client
+                google-auth-httplib2 google-auth-oauthlib requests
+RUN:
+    python master_run.py
+"""
+
+import os, sys, json, time, shutil, subprocess, tempfile, pickle, re
+from datetime import datetime, timedelta
+import requests
+
+# ==================================================
+#   CONFIGURATION
+# ==================================================
+GROQ_API_KEY         = ""   # console.groq.com
+CHANNEL_LOGO         = ""
+BG_MUSIC             = ""
+USED_WORDS_FILE      = "used_words.txt"
+YOUTUBE_CREDS        = "youtube_token.pickle"
+YOUTUBE_SECRETS      = ""
+SCHEDULE_HOURS_AHEAD = 1
+GERMAN_VOICE_EDGE    = "de-DE-ConradNeural"
+ENGLISH_VOICE_EDGE   = "en-US-GuyNeural"
+DIFFICULTY_LEVEL     = "beginner"
+TAGLINE_TEXT         = "Bleib neugierig. Owl Learner."
+TAGLINE_FILE         = "tagline_audio.wav"
+VW, VH               = 1080, 1920
+VOICE_WEIGHT         = 1.0
+MUSIC_WEIGHT         = 0.10
+XFADE_DURATION       = 0.4
+HOOK_DURATION        = 2.5
+CARD_PAD_Y           = 28
+GOLD  = "FFD700"
+TEAL  = "00C9A7"
+CORAL = "FF6B6B"
+PURP  = "C77DFF"
+DARK  = "080818"
+NAVY  = "0d0d24"
+
+# ==================================================
+#   FFMPEG HELPERS
+# ==================================================
+
+def get_ffmpeg():
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
+    if os.path.exists(local): return local
+    if shutil.which("ffmpeg"): return "ffmpeg"
+    return None
+
+def run_ff(cmd, raise_on_error=True):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\nFFmpeg ERROR:\n{r.stderr[-3000:]}")
+        if raise_on_error:
+            raise subprocess.CalledProcessError(r.returncode, cmd)
+    return r
+
+def get_dur(ffmpeg, path):
+    r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True)
+    for line in r.stderr.split("\n"):
+        if "Duration" in line:
+            try:
+                d = line.split("Duration:")[1].split(",")[0].strip()
+                h, m, s = d.split(":")
+                return float(h)*3600 + float(m)*60 + float(s)
+            except: pass
+    return 3.0
+
+def safe(text, maxlen=48):
+    """Strip unsafe chars for FFmpeg drawtext. Keeps German umlauts."""
+    text = re.sub(r'[^\w\s\u00C0-\u024F\-\.]', ' ', text)
+    for ch in ["'", '"', ":", "[", "]", "%", ";", ",", "\\", "(", ")", "/"]:
+        text = text.replace(ch, " ")
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:maxlen]
+
+def fade(t=0.3):
+    return f"if(lt(t,{float(t)}),t/{float(t)},1)"
+
+def ffont(path):
+    """Font path safe for FFmpeg filtergraph on Windows."""
+    p = path.replace("\\", "/")
+    if len(p) > 1 and p[1] == ":":
+        p = p[0] + "\\:" + p[2:]
+    return p
+
+def resample_wav(ffmpeg, in_path, out_path):
+    """Force consistent 44100Hz stereo WAV — fixes sync drift."""
+    run_ff([ffmpeg, "-y", "-i", in_path,
+            "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", out_path],
+           raise_on_error=False)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+        return out_path
+    return in_path
+
+# ==================================================
+#   VOICE GENERATION
+# ==================================================
+
+def tts_pyttsx3_wav(text, out_wav):
+    if not text.strip(): return False
+    try:
+        import pyttsx3, threading
+        success = [False]
+        def _run():
+            try:
+                engine = pyttsx3.init()
+                for v in engine.getProperty('voices'):
+                    if any(k in (v.name+v.id).lower() for k in
+                           ["english","en-us","david","zira","mark","hazel"]):
+                        engine.setProperty('voice', v.id); break
+                engine.setProperty('rate', 150)
+                engine.setProperty('volume', 0.95)
+                engine.save_to_file(text, out_wav)
+                engine.runAndWait(); engine.stop()
+                success[0] = True
+            except Exception as e:
+                print(f"        pyttsx3: {e}")
+        t = threading.Thread(target=_run, daemon=True)
+        t.start(); t.join(timeout=15)
+        if t.is_alive(): return False
+        return os.path.exists(out_wav) and os.path.getsize(out_wav) > 4096
+    except: return False
+
+def tts_edge_wav(text, voice, out_wav):
+    if not text.strip(): return False
+    ffmpeg = get_ffmpeg()
+    tmp = out_wav.replace(".wav", "_e.mp3")
+    try:
+        import asyncio, edge_tts
+        async def _run():
+            await edge_tts.Communicate(text=text, voice=voice).save(tmp)
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+        try: loop.run_until_complete(_run())
+        finally: loop.close(); asyncio.set_event_loop(None)
+        if not os.path.exists(tmp) or os.path.getsize(tmp) < 3000: return False
+        run_ff([ffmpeg,"-y","-i",tmp,"-ar","44100","-ac","2","-sample_fmt","s16",out_wav],
+               raise_on_error=False)
+        return os.path.exists(out_wav) and os.path.getsize(out_wav) > 4096
+    except Exception as e:
+        print(f"        Edge TTS: {e}"); return False
+    finally:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except: pass
+
+def tts_gtts_wav(text, lang, out_wav):
+    if not text.strip(): return False
+    ffmpeg = get_ffmpeg()
+    tmp = out_wav.replace(".wav", "_g.mp3")
+    try:
+        from gtts import gTTS
+        gTTS(text=text, lang=lang, slow=(lang=="de")).save(tmp)
+        if not os.path.exists(tmp) or os.path.getsize(tmp) < 1000: return False
+        run_ff([ffmpeg,"-y","-i",tmp,"-ar","44100","-ac","2","-sample_fmt","s16",out_wav],
+               raise_on_error=False)
+        return os.path.exists(out_wav) and os.path.getsize(out_wav) > 4096
+    except Exception as e:
+        print(f"        gTTS: {e}"); return False
+    finally:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except: pass
+
+def normalize_wav(ffmpeg, in_wav, out_wav):
+    try:
+        run_ff([ffmpeg,"-y","-i",in_wav,
+                "-af","loudnorm=I=-14:TP=-2:LRA=11",
+                "-ar","44100","-ac","2","-sample_fmt","s16",out_wav])
+        if os.path.exists(out_wav) and os.path.getsize(out_wav) > 4096:
+            return out_wav
+    except: pass
+    return in_wav
+
+def generate_voice_wav(text, lang, out_wav, edge_voice=None):
+    """Generate voice: pyttsx3 → Edge TTS → gTTS, then normalize to 44100Hz."""
+    ffmpeg  = get_ffmpeg()
+    tmp_raw = out_wav.replace(".wav", "_raw.wav")
+    tmp_nrm = out_wav.replace(".wav", "_nrm.wav")
+    ok = False
+
+    if lang == "en":
+        if tts_pyttsx3_wav(text, tmp_raw):
+            ok = True; print(f"        [pyttsx3 ✓] {os.path.basename(out_wav)}")
+
+    if not ok and edge_voice:
+        if tts_edge_wav(text, edge_voice, tmp_raw):
+            ok = True; print(f"        [Edge TTS ✓] {os.path.basename(out_wav)}")
+
+    if not ok:
+        if tts_gtts_wav(text, lang, tmp_raw):
+            ok = True; print(f"        [gTTS ✓] {os.path.basename(out_wav)}")
+
+    if not ok or not os.path.exists(tmp_raw):
+        print(f"        [silence] {os.path.basename(out_wav)}")
+        run_ff([ffmpeg,"-y","-f","lavfi","-i","anullsrc=r=44100:cl=stereo",
+                "-t","2","-sample_fmt","s16",tmp_raw])
+
+    # SYNC FIX: always normalize AND resample to exactly 44100Hz s16
+    normalized = normalize_wav(ffmpeg, tmp_raw, tmp_nrm)
+    resampled  = out_wav.replace(".wav","_rs.wav")
+    final_src  = resample_wav(ffmpeg, normalized, resampled)
+    shutil.copy2(final_src, out_wav)
+
+    for f in [tmp_raw, tmp_nrm, resampled]:
+        try:
+            if f and f != out_wav and os.path.exists(f): os.remove(f)
+        except: pass
+    return out_wav
+
+def ensure_tagline(script_dir, ffmpeg):
+    path = os.path.join(script_dir, TAGLINE_FILE)
+    if os.path.exists(path) and os.path.getsize(path) > 4096:
+        # SYNC FIX: re-resample tagline to match other audio
+        rs = path.replace(".wav","_rs.wav")
+        resample_wav(ffmpeg, path, rs)
+        if os.path.exists(rs) and os.path.getsize(rs) > 4096:
+            shutil.copy2(rs, path)
+            try: os.remove(rs)
+            except: pass
+        print("      Tagline audio ✓"); return path
+    print("      Generating tagline audio (one-time)...")
+    generate_voice_wav(TAGLINE_TEXT, "en", path, ENGLISH_VOICE_EDGE)
+    return path
+
+def generate_audio(data, work_dir, ffmpeg):
+    print("[3/5] Generating voice audio...")
+    jobs = [
+        ("intro",      data["intro_speech"],            "en", ENGLISH_VOICE_EDGE),
+        ("word_de",    data["german_word"],              "de", GERMAN_VOICE_EDGE),
+        ("word_en",    data["word_speech_en"],           "en", ENGLISH_VOICE_EDGE),
+        ("example_de", data["example_sentence_german"], "de", GERMAN_VOICE_EDGE),
+        ("example_en", data["example_speech_en"],       "en", ENGLISH_VOICE_EDGE),
+        ("outro",      data["outro_speech"],             "en", ENGLISH_VOICE_EDGE),
+        # NEW: dynamic comment prompt audio
+        ("comment",    data["comment_prompt_speech"],   "en", ENGLISH_VOICE_EDGE),
+    ]
+    audio = {}
+    for key, text, lang, voice in jobs:
+        path = os.path.join(work_dir, f"audio_{key}.wav")
+        generate_voice_wav(text, lang, path, edge_voice=voice)
+        audio[key] = path
+        time.sleep(0.3)
+    return audio
+
+# ==================================================
+#   FONTS
+# ==================================================
+
+def get_fonts(script_dir):
+    files = {
+        "bold":    ("PoppinsBold.ttf",   "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf"),
+        "medium":  ("PoppinsMedium.ttf", "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf"),
+        "regular": ("PoppinsReg.ttf",    "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf"),
+    }
+    fonts = {}
+    for key, (fname, url) in files.items():
+        path = os.path.join(script_dir, fname)
+        if not os.path.exists(path):
+            try:
+                r = requests.get(url, timeout=20); r.raise_for_status()
+                with open(path,"wb") as f: f.write(r.content)
+                print(f"      Font {fname} ✓")
+            except:
+                for wf in ["C:/Windows/Fonts/Arial.ttf","C:/Windows/Fonts/arial.ttf",
+                           "C:/Windows/Fonts/calibri.ttf","C:/Windows/Fonts/verdana.ttf"]:
+                    if os.path.exists(wf): shutil.copy(wf,path); break
+        fonts[key] = path
+    return fonts
+
+# ==================================================
+#   WORD GENERATION  (with dynamic comment prompt)
+# ==================================================
+
+def get_used_words():
+    if not os.path.exists(USED_WORDS_FILE): return []
+    with open(USED_WORDS_FILE,"r",encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip()]
+
+def save_used_word(word):
+    with open(USED_WORDS_FILE,"a",encoding="utf-8") as f: f.write(word+"\n")
+
+def generate_word_data():
+    used  = get_used_words()
+    avoid = ", ".join(used[-50:]) if used else "none yet"
+    diff_map = {
+        "beginner":     "Choose a very common everyday German word (A1-A2 level).",
+        "intermediate": "Choose a moderately complex German word (B1-B2 level).",
+        "advanced":     "Choose a complex nuanced German compound word (C1-C2 level).",
+    }
+    diff_instr = diff_map.get(DIFFICULTY_LEVEL, diff_map["beginner"])
+
+    prompt = f"""You are a German language teacher making YouTube Shorts.
+{diff_instr}
+Do NOT use any of these words: {avoid}
+IMPORTANT: No apostrophes anywhere in the JSON values.
+Return ONLY valid JSON, no markdown:
+{{
+  "german_word": "Schule",
+  "english_translation": "School",
+  "meaning": "A place where children go to learn",
+  "meaning_short": "Place for learning",
+  "example_sentence_german": "Ich gehe jeden Tag zur Schule.",
+  "example_sentence_english": "I go to school every day.",
+  "intro_speech": "Welcome to Owl Learner. Today we learn a beautiful German word.",
+  "word_speech_en": "The word is Schule. It means School. A place where children go to learn.",
+  "example_speech_en": "Here is an example. I go to school every day.",
+  "outro_speech": "Thank you for watching. Subscribe for a new German word every single day.",
+  "hook_text": "Do you know the German word for school",
+  "comment_prompt_display": "What is the German word for GO?",
+  "comment_prompt_speech": "Now it is your turn. Look at the example sentence. What do you think is the German word for GO? Write your answer in the comments below. We will reveal it in the next video!",
+  "youtube_title": "Schule - The German Word for School | Learn German #Shorts",
+  "youtube_description": "Today we learn SCHULE!\\n\\nWord: Schule\\nMeans: School\\nMeaning: A place where children go to learn\\n\\nExample:\\nDE: Ich gehe jeden Tag zur Schule.\\nEN: I go to school every day.\\n\\nSubscribe for a new German word every day!\\n\\n#LearnGerman #GermanWords #Deutsch #Shorts #LanguageLearning",
+  "tags": ["learn german","german words","deutsch","language learning","shorts"]
+}}
+
+RULES for comment_prompt fields:
+- Look at the EXAMPLE SENTENCE and pick ONE common word from it
+- The picked word must NOT be the main german_word itself
+- comment_prompt_display: short question like "What is the German word for [ENGLISH WORD]?"
+- comment_prompt_speech: engaging spoken version, ends with "Write your answer in the comments!"
+- No apostrophes anywhere
+- Keep comment_prompt_display under 45 characters"""
+
+    url     = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body    = {"model":"llama-3.3-70b-versatile",
+               "messages":[{"role":"user","content":prompt}],
+               "temperature":0.9}
+
+    print("[1/5] Generating word with Groq...")
+    for attempt in range(5):
+        try:
+            resp = requests.post(url,headers=headers,json=body,timeout=30)
+            if resp.status_code == 429:
+                wait=30*(attempt+1)
+                print(f"      Rate limited {wait}s..."); time.sleep(wait); continue
+            resp.raise_for_status(); break
+        except requests.exceptions.RequestException as e:
+            print(f"      Attempt {attempt+1}: {e}")
+            if attempt<4: time.sleep(10)
+            else: raise
+
+    raw = resp.json()["choices"][0]["message"]["content"]
+    raw = raw.replace("```json","").replace("```","").strip()
+    s,e = raw.find("{"), raw.rfind("}")+1
+    if s!=-1 and e>s: raw=raw[s:e]
+    data = json.loads(raw)
+
+    # Fallbacks if Groq missed fields
+    if "comment_prompt_display" not in data:
+        data["comment_prompt_display"] = f"Can you translate a word from the example?"
+    if "comment_prompt_speech" not in data:
+        data["comment_prompt_speech"] = (
+            f"Now it is your turn. Can you find another German word from the example sentence? "
+            f"Write your answer in the comments below!")
+    if "hook_text" not in data:
+        data["hook_text"] = f"Do you know the German word for {data['english_translation']}"
+
+    w = data["english_translation"]
+    data["image_prompts"] = [
+        f"cinematic warm golden hour light concept of {w}, bokeh background, no text",
+        f"dramatic close up texture representing {w}, moody lighting, film grain, no text",
+        f"cozy european cafe representing {w}, warm amber light bokeh, no text",
+        f"wide cinematic landscape representing {w}, golden sunset, no text",
+        f"abstract fluid art representing {w}, deep jewel tones, painterly, no text",
+        f"overhead flat lay concept of {w}, natural light, clean, no text",
+        f"moody forest path representing {w}, rays of light, cinematic, no text",
+        f"minimalist concept art of {w}, bold shapes, limited palette, no text",
+        f"night cityscape representing {w}, light trails, long exposure style, no text",
+        f"serene nature macro shot representing {w}, morning dew, soft focus, no text",
+    ]
+    print(f"      Word: {data['german_word']} = {data['english_translation']}")
+    print(f"      Comment prompt: {data['comment_prompt_display']}")
+    return data
+
+# ==================================================
+#   IMAGE DOWNLOAD
+# ==================================================
+
+def download_images(prompts, work_dir):
+    print("[2/5] Downloading 10 images...")
+    paths = []
+    for i, prompt in enumerate(prompts):
+        out = os.path.join(work_dir, f"img_{i+1}.jpg"); ok=False
+        try:
+            enc = requests.utils.quote(prompt)
+            url = (f"https://image.pollinations.ai/prompt/{enc}"
+                   f"?width=1080&height=1920&nologo=true&seed={int(time.time())+i*113}")
+            r = requests.get(url,timeout=120); r.raise_for_status()
+            with open(out,"wb") as f: f.write(r.content)
+            print(f"      Image {i+1}/10 ✓"); ok=True
+        except Exception as ex:
+            print(f"      Image {i+1} failed: {ex}")
+        if not ok:
+            try:
+                r = requests.get(
+                    f"https://picsum.photos/1080/1920?random={i+int(time.time())}",
+                    timeout=30)
+                r.raise_for_status()
+                with open(out,"wb") as f: f.write(r.content)
+                print(f"      Image {i+1}/10 backup ✓")
+            except: out=None
+        paths.append(out); time.sleep(1.5)
+    return paths
+
+# ==================================================
+#   RENDER HELPERS
+# ==================================================
+
+def rounded_card(ffmpeg, work_dir, w, h, r, hex_color, alpha, tag):
+    w = min(w, VW-20); h = min(h, VH-100)
+    out = os.path.join(work_dir, f"{tag}.png")
+    run_ff([ffmpeg,"-y","-f","lavfi","-i",f"color=#{hex_color}:s={w}x{h}",
+            "-vf",(f"format=rgba,"
+                   f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                   f"a='if("
+                   f"between(X,{r},{w-r})*between(Y,0,{h})"
+                   f"+between(X,0,{w})*between(Y,{r},{h-r})"
+                   f"+lte(hypot(X-{r},Y-{r}),{r})"
+                   f"+lte(hypot(X-{w-r},Y-{r}),{r})"
+                   f"+lte(hypot(X-{r},Y-{h-r}),{r})"
+                   f"+lte(hypot(X-{w-r},Y-{h-r}),{r})"
+                   f",{int(alpha)},0)'"),
+            "-frames:v","1",out])
+    return out
+
+def overlay_card(ffmpeg, base, card_png, cx, cy, work_dir, tag):
+    out = os.path.join(work_dir,f"{tag}.mp4")
+    run_ff([ffmpeg,"-y","-i",base,"-i",card_png,
+            "-filter_complex",
+            f"[0:v][1:v]overlay=x={cx}:y={cy}:format=auto[ov]",
+            "-map","[ov]","-c:v","libx264","-pix_fmt","yuv420p","-an",out])
+    return out
+
+def make_bg(ffmpeg, images, duration, work_dir, tag):
+    n = min(len(images), max(2, int(duration/3)+1))
+    imgs = [img for img in images[:n] if img and os.path.exists(img)]
+    if not imgs: imgs = [images[0]]
+    dur_each = duration / len(imgs)
+    zoom_styles = [
+        "z='min(zoom+0.0015,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+        "z='min(zoom+0.0012,1.25)':x='0':y='0'",
+        "z='min(zoom+0.0010,1.2)':x='iw-(iw/zoom)':y='ih/2-(ih/zoom/2)'",
+        "z='min(zoom+0.0013,1.28)':x='iw/2-(iw/zoom/2)':y='ih-(ih/zoom)'",
+    ]
+    clips = []
+    for i,img in enumerate(imgs):
+        out = os.path.join(work_dir,f"{tag}_kb{i}.mp4")
+        df  = int(dur_each*30)+10
+        run_ff([ffmpeg,"-y","-loop","1","-i",img,
+                "-vf",(f"scale={VW}:{VH}:force_original_aspect_ratio=decrease,"
+                       f"pad={VW}:{VH}:(ow-iw)/2:(oh-ih)/2:color=#080818,"
+                       f"zoompan={zoom_styles[i%4]}:d={df}:s={VW}x{VH}:fps=30"),
+                "-t",str(dur_each+0.6),"-r","30",
+                "-c:v","libx264","-pix_fmt","yuv420p","-an",out])
+        clips.append(out)
+    if len(clips)==1: return clips[0]
+    fade_dur=0.5; inputs=[]; parts=[]; prev="[0:v]"
+    for c in clips: inputs+=["-i",c]
+    for i in range(1,len(clips)):
+        offset=max(0.2,dur_each*i-fade_dur*i)
+        nxt=f"[xf{i}]" if i<len(clips)-1 else "[bgout]"
+        parts.append(
+            f"{prev}[{i}:v]xfade=transition=fade:"
+            f"duration={fade_dur}:offset={offset}{nxt}")
+        prev=f"[xf{i}]"
+    out_bg=os.path.join(work_dir,f"{tag}_bg.mp4")
+    run_ff([ffmpeg,"-y"]+inputs+[
+        "-filter_complex",";".join(parts),"-map","[bgout]",
+        "-t",str(duration),"-r","30","-c:v","libx264","-pix_fmt","yuv420p","-an",out_bg])
+    return out_bg
+
+def dark_overlay(ffmpeg, base, work_dir, tag, strength=0.5):
+    out = os.path.join(work_dir,f"{tag}_dk.mp4")
+    run_ff([ffmpeg,"-y","-i",base,
+            "-vf",f"drawbox=x=0:y=0:w=iw:h=ih:color=#000000@{strength}:t=fill",
+            "-c:v","libx264","-pix_fmt","yuv420p","-an",out])
+    return out
+
+def add_text_and_audio(ffmpeg, base_video, audio_wav, vf_text, work_dir, tag):
+    """
+    SYNC FIX: re-encode video to CFR 30fps and audio to 44100Hz
+    before merging — prevents drift between segments.
+    """
+    # Step 1: draw text
+    txt_out = os.path.join(work_dir,f"{tag}_t.mp4")
+    run_ff([ffmpeg,"-y","-i",base_video,"-vf",vf_text,
+            "-c:v","libx264","-pix_fmt","yuv420p",
+            "-r","30","-vsync","cfr","-an",txt_out])
+
+    # Step 2: trim to audio duration
+    dur  = get_dur(ffmpeg, audio_wav) + 0.15
+    trim = os.path.join(work_dir,f"{tag}_trim.mp4")
+    run_ff([ffmpeg,"-y","-i",txt_out,"-t",str(dur),
+            "-c:v","libx264","-pix_fmt","yuv420p",
+            "-r","30","-vsync","cfr","-an",trim])
+
+    # Step 3: merge audio — re-encode both streams for sync
+    final = os.path.join(work_dir,f"{tag}_final.mp4")
+    run_ff([ffmpeg,"-y","-i",trim,"-i",audio_wav,
+            "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-vsync","cfr",
+            "-c:a","aac","-ar","44100","-ac","2","-b:a","192k",
+            "-shortest","-avoid_negative_ts","make_zero",final])
+    return final
+
+def join_segments(ffmpeg, segments, work_dir, tag):
+    """Join with xfade transitions, fallback to re-encode concat."""
+    if len(segments)==1: return segments[0]
+
+    # Try xfade
+    try:
+        inputs=[]; durations=[]
+        for s in segments:
+            inputs+=["-i",s]; durations.append(get_dur(ffmpeg,s))
+        n=len(segments); filters=[]; cum_offset=0.0
+        prev_v="[0:v]"; prev_a="[0:a]"
+        for i in range(1,n):
+            cum_offset += durations[i-1] - XFADE_DURATION
+            offset = max(0.1, cum_offset)
+            v_out = f"[xv{i}]" if i<n-1 else "[vout]"
+            a_out = f"[xa{i}]" if i<n-1 else "[aout]"
+            filters.append(
+                f"{prev_v}[{i}:v]xfade=transition=fade:"
+                f"duration={XFADE_DURATION}:offset={offset}{v_out}")
+            filters.append(
+                f"{prev_a}[{i}:a]acrossfade=d={XFADE_DURATION}{a_out}")
+            prev_v=f"[xv{i}]"; prev_a=f"[xa{i}]"
+        out = os.path.join(work_dir,f"{tag}_joined.mp4")
+        run_ff([ffmpeg,"-y"]+inputs+[
+            "-filter_complex",";".join(filters),
+            "-map","[vout]","-map","[aout]",
+            "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-vsync","cfr",
+            "-c:a","aac","-ar","44100","-ac","2","-b:a","192k",out])
+        print("      xfade join ✓"); return out
+    except Exception as e:
+        print(f"      xfade failed ({e}), using concat...")
+
+    # Fallback: concat with full re-encode (guarantees sync)
+    out = os.path.join(work_dir,f"{tag}_concat.mp4")
+    cf  = os.path.join(work_dir,f"{tag}_cf.txt")
+    with open(cf,"w") as f:
+        for s in segments: f.write(f"file '{s.replace(os.sep,'/')}'\n")
+    run_ff([ffmpeg,"-y","-f","concat","-safe","0","-i",cf,
+            "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-vsync","cfr",
+            "-c:a","aac","-ar","44100","-ac","2","-b:a","192k",out])
+    return out
+
+# ==================================================
+#   RENDER VIDEO  (7 segments)
+# ==================================================
+
+def render_video(data, images, audio, tagline_path,
+                 work_dir, logo_path, music_path, fonts):
+    print("[4/5] Rendering video...")
+    ffmpeg = get_ffmpeg()
+    output = os.path.join(work_dir,"final_video.mp4")
+
+    fb = ffont(fonts["bold"])
+    fm = ffont(fonts["medium"])
+    fr = ffont(fonts["regular"])
+
+    word    = safe(data["german_word"],        30)
+    trans   = safe(data["english_translation"],30)
+    meaning = safe(data.get("meaning_short", data["meaning"]), 50)
+    ex_de   = safe(data["example_sentence_german"],  52)
+    ex_en   = safe(data["example_sentence_english"], 52)
+    hook_txt= safe(data.get("hook_text",""), 52)
+    # Comment prompt display text — safe for drawtext
+    comment_display = safe(data.get("comment_prompt_display",""), 44)
+
+    valid = [img for img in images if img and os.path.exists(img)]
+    if len(valid)<2: print("Not enough images"); sys.exit(1)
+
+    print("      Creating rounded cards...")
+    c_brand   = rounded_card(ffmpeg,work_dir,1040,130,24,NAVY,    220,"cbrand")
+    c_word    = rounded_card(ffmpeg,work_dir,1040,500,32,DARK,    238,"cword")
+    c_trans   = rounded_card(ffmpeg,work_dir,1040,230,28,"0a1020",235,"ctrans")
+    c_meaning = rounded_card(ffmpeg,work_dir,1040,120,24,"0a0a22",215,"cmeaning")
+    c_example = rounded_card(ffmpeg,work_dir,1040,500,32,DARK,    238,"cex")
+    c_outro   = rounded_card(ffmpeg,work_dir,1040,560,32,DARK,    240,"coutro")
+    c_tag     = rounded_card(ffmpeg,work_dir, 900, 88,28,"1a1a30",215,"ctag")
+    c_sub     = rounded_card(ffmpeg,work_dir, 600,100,36,"CC2222",248,"csub")
+    c_hook    = rounded_card(ffmpeg,work_dir,1040,240,32,"080818",230,"chook")
+    # NEW: comment card — bright purple/teal accent, engaging feel
+    c_comment = rounded_card(ffmpeg,work_dir,1040,460,32,"0e0e28",242,"ccomment")
+    c_comment_btn = rounded_card(ffmpeg,work_dir,700,88,28,"1a0a40",230,"ccbtn")
+
+    segs = []
+
+    # ── HOOK ───────────────────────────────────────────────
+    d_hook  = HOOK_DURATION
+    bg_hook = make_bg(ffmpeg, valid[0:2], d_hook+0.5, work_dir, "bghook")
+    bh_dk   = dark_overlay(ffmpeg, bg_hook, work_dir, "bghook", 0.55)
+    v_hook  = overlay_card(ffmpeg, bh_dk, c_hook, 20, 820, work_dir, "hook_card")
+    silence = os.path.join(work_dir,"hook_sil.wav")
+    run_ff([ffmpeg,"-y","-f","lavfi","-i","anullsrc=r=44100:cl=stereo",
+            "-t",str(d_hook),"-ar","44100","-ac","2","-sample_fmt","s16",silence])
+    hook_seg = add_text_and_audio(ffmpeg, v_hook, silence,
+        f"drawtext=text='OWL LEARNER':fontfile='{fb}':fontsize=44:"
+        f"fontcolor=#{GOLD}:x=(w-tw)/2:y=848:alpha='{fade()}',"
+        f"drawtext=text='{hook_txt}':fontfile='{fb}':fontsize=34:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y=912:"
+        f"shadowcolor=black:shadowx=2:shadowy=3:alpha='{fade(0.2)}',"
+        f"drawtext=text='Keep watching to find out':fontfile='{fr}':fontsize=24:"
+        f"fontcolor=#aaaaaa:x=(w-tw)/2:y=986:alpha='{fade(0.5)}'",
+        work_dir,"hook")
+    segs.append(hook_seg); print("      Hook ✓")
+
+    # ── SEG 1 — INTRO ──────────────────────────────────────
+    d1   = get_dur(ffmpeg,audio["intro"])
+    bg1  = make_bg(ffmpeg,valid[0:3],d1+0.5,work_dir,"bg1")
+    b1dk = dark_overlay(ffmpeg,bg1,work_dir,"bg1",0.6)
+    v1   = overlay_card(ffmpeg,b1dk,c_brand,20,870,work_dir,"s1_brand")
+    s1   = add_text_and_audio(ffmpeg,v1,audio["intro"],
+        f"drawtext=text='OWL LEARNER':fontfile='{fb}':fontsize=50:"
+        f"fontcolor=#{GOLD}:x=(w-tw)/2:y=892:alpha='{fade()}',"
+        f"drawtext=text='Learn German Daily':fontfile='{fr}':fontsize=26:"
+        f"fontcolor=#bbbbbb:x=(w-tw)/2:y=952:alpha='{fade(0.4)}',"
+        f"drawbox=x=390:y=1000:w=300:h=2:color=#{GOLD}@0.4:t=fill,"
+        f"drawtext=text='New word today':fontfile='{fm}':fontsize=22:"
+        f"fontcolor=#666666:x=(w-tw)/2:y=1012:alpha='{fade(0.6)}'",
+        work_dir,"s1")
+    segs.append(s1); print("      Seg 1 ✓ — intro")
+
+    # ── SEG 2 — GERMAN WORD ────────────────────────────────
+    CT2     = 560
+    word_fs = max(72, min(116, 2000//max(len(word),1)))
+    d2      = get_dur(ffmpeg,audio["word_de"])
+    bg2     = make_bg(ffmpeg,valid[1:5],d2+0.5,work_dir,"bg2")
+    b2dk    = dark_overlay(ffmpeg,bg2,work_dir,"bg2",0.5)
+    v2      = overlay_card(ffmpeg,b2dk,c_word,20,CT2,work_dir,"s2_card")
+    s2      = add_text_and_audio(ffmpeg,v2,audio["word_de"],
+        f"drawtext=text='das Wort':fontfile='{fr}':fontsize=26:"
+        f"fontcolor=#{TEAL}:x=(w-tw)/2:y={CT2+CARD_PAD_Y}:alpha='{fade()}',"
+        f"drawbox=x=200:y={CT2+CARD_PAD_Y+36}:w=680:h=2:color=#{TEAL}@0.4:t=fill,"
+        f"drawtext=text='{word}':fontfile='{fb}':fontsize={word_fs}:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={CT2+CARD_PAD_Y+50}:"
+        f"shadowcolor=#{TEAL}:shadowx=0:shadowy=5:alpha='{fade(0.1)}',"
+        f"drawtext=text='Deutsch':fontfile='{fm}':fontsize=24:"
+        f"fontcolor=#{TEAL}:x=(w-tw)/2:y={CT2+500-CARD_PAD_Y-60}:alpha='{fade(0.3)}',"
+        f"drawtext=text='listen carefully':fontfile='{fr}':fontsize=20:"
+        f"fontcolor=#444466:x=(w-tw)/2:y={CT2+500-CARD_PAD_Y-30}:alpha='{fade(0.5)}'",
+        work_dir,"s2")
+    segs.append(s2); print("      Seg 2 ✓ — German word")
+
+    # ── SEG 3 — TRANSLATION ────────────────────────────────
+    CT3      = 680; CM3 = 930
+    trans_fs = max(52, min(78, 2200//max(len(trans),1)))
+    d3       = get_dur(ffmpeg,audio["word_en"])
+    bg3      = make_bg(ffmpeg,valid[2:6],d3+0.5,work_dir,"bg3")
+    b3dk     = dark_overlay(ffmpeg,bg3,work_dir,"bg3",0.45)
+    v3a      = overlay_card(ffmpeg,b3dk,c_trans,  20,CT3,work_dir,"s3_trans")
+    v3b      = overlay_card(ffmpeg,v3a, c_meaning,20,CM3,work_dir,"s3_meaning")
+    s3       = add_text_and_audio(ffmpeg,v3b,audio["word_en"],
+        f"drawtext=text='{word}':fontfile='{fm}':fontsize=32:"
+        f"fontcolor=#{GOLD}:x=(w-tw)/2:y={CT3+CARD_PAD_Y}:alpha='{fade()}',"
+        f"drawtext=text='means':fontfile='{fr}':fontsize=24:"
+        f"fontcolor=#777777:x=(w-tw)/2:y={CT3+CARD_PAD_Y+42}:alpha='{fade(0.2)}',"
+        f"drawtext=text='{trans}':fontfile='{fb}':fontsize={trans_fs}:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={CT3+CARD_PAD_Y+78}:"
+        f"shadowcolor=black:shadowx=2:shadowy=3:alpha='{fade(0.15)}',"
+        f"drawtext=text='{meaning}':fontfile='{fr}':fontsize=25:"
+        f"fontcolor=#aaaaaa:x=(w-tw)/2:y={CM3+CARD_PAD_Y+10}:alpha='{fade(0.4)}'",
+        work_dir,"s3")
+    segs.append(s3); print("      Seg 3 ✓ — translation")
+
+    # ── SEG 4 — EXAMPLE DE + EN ────────────────────────────
+    CT4    = 500
+    inner4 = CT4+CARD_PAD_Y
+    ex_vf  = (
+        f"drawtext=text='Example Sentence':fontfile='{fb}':fontsize=34:"
+        f"fontcolor=#{CORAL}:x=(w-tw)/2:y={inner4}:alpha='{fade()}',"
+        f"drawbox=x=40:y={inner4+44}:w={VW-80}:h=2:color=#{CORAL}@0.3:t=fill,"
+        f"drawtext=text='German':fontfile='{fm}':fontsize=26:"
+        f"fontcolor=#{CORAL}:x=55:y={inner4+56}:alpha='{fade(0.2)}',"
+        f"drawtext=text='{ex_de}':fontfile='{fr}':fontsize=28:"
+        f"fontcolor=#ffffff:x=55:y={inner4+90}:alpha='{fade(0.3)}',"
+        f"drawbox=x=40:y={inner4+146}:w={VW-80}:h=1:color=#333355:t=fill,"
+        f"drawtext=text='English':fontfile='{fm}':fontsize=26:"
+        f"fontcolor=#8888bb:x=55:y={inner4+160}:alpha='{fade(0.4)}',"
+        f"drawtext=text='{ex_en}':fontfile='{fr}':fontsize=28:"
+        f"fontcolor=#cccccc:x=55:y={inner4+194}:alpha='{fade(0.5)}'"
+    )
+    d4a  = get_dur(ffmpeg,audio["example_de"])
+    bg4a = make_bg(ffmpeg,valid[4:8],d4a+0.5,work_dir,"bg4a")
+    b4adk= dark_overlay(ffmpeg,bg4a,work_dir,"bg4a",0.5)
+    v4a  = overlay_card(ffmpeg,b4adk,c_example,20,CT4,work_dir,"s4a_card")
+    s4a  = add_text_and_audio(ffmpeg,v4a,audio["example_de"],ex_vf,work_dir,"s4a")
+
+    d4b  = get_dur(ffmpeg,audio["example_en"])
+    bg4b = make_bg(ffmpeg,valid[5:9],d4b+0.5,work_dir,"bg4b")
+    b4bdk= dark_overlay(ffmpeg,bg4b,work_dir,"bg4b",0.5)
+    v4b  = overlay_card(ffmpeg,b4bdk,c_example,20,CT4,work_dir,"s4b_card")
+    s4b  = add_text_and_audio(ffmpeg,v4b,audio["example_en"],ex_vf,work_dir,"s4b")
+
+    s4  = os.path.join(work_dir,"s4.mp4")
+    cf4 = os.path.join(work_dir,"cf4.txt")
+    with open(cf4,"w") as f:
+        f.write(f"file '{s4a.replace(os.sep,'/')}'\n")
+        f.write(f"file '{s4b.replace(os.sep,'/')}'\n")
+    run_ff([ffmpeg,"-y","-f","concat","-safe","0","-i",cf4,
+            "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-vsync","cfr",
+            "-c:a","aac","-ar","44100","-ac","2","-b:a","192k",s4])
+    segs.append(s4); print("      Seg 4 ✓ — example")
+
+    # ── SEG 5 — OUTRO ──────────────────────────────────────
+    CT5    = 620; CSUB = 1260
+    inner5 = CT5+CARD_PAD_Y
+    d5     = get_dur(ffmpeg,audio["outro"])
+    bg5    = make_bg(ffmpeg,valid[7:],d5+0.5,work_dir,"bg5")
+    b5dk   = dark_overlay(ffmpeg,bg5,work_dir,"bg5",0.6)
+    v5a    = overlay_card(ffmpeg,b5dk,c_outro,20,CT5, work_dir,"s5_outro")
+    v5b    = overlay_card(ffmpeg,v5a, c_sub, 240,CSUB,work_dir,"s5_sub")
+    s5     = add_text_and_audio(ffmpeg,v5b,audio["outro"],
+        f"drawtext=text='Today you learned':fontfile='{fm}':fontsize=28:"
+        f"fontcolor=#aaaaaa:x=(w-tw)/2:y={inner5}:alpha='{fade(0.3)}',"
+        f"drawbox=x=300:y={inner5+40}:w=480:h=2:color=#{GOLD}@0.3:t=fill,"
+        f"drawtext=text='{word}':fontfile='{fb}':fontsize=106:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={inner5+50}:"
+        f"shadowcolor=#{PURP}:shadowx=0:shadowy=5:alpha='{fade(0.1)}',"
+        f"drawtext=text='{trans}':fontfile='{fm}':fontsize=40:"
+        f"fontcolor=#{GOLD}:x=(w-tw)/2:y={inner5+176}:alpha='{fade(0.2)}',"
+        f"drawtext=text='{meaning}':fontfile='{fr}':fontsize=24:"
+        f"fontcolor=#888888:x=(w-tw)/2:y={inner5+228}:alpha='{fade(0.3)}',"
+        f"drawtext=text='Owl Learner':fontfile='{fb}':fontsize=28:"
+        f"fontcolor=#{TEAL}:x=(w-tw)/2:y={inner5+278}:alpha='{fade(0.5)}',"
+        f"drawtext=text='SUBSCRIBE':fontfile='{fb}':fontsize=32:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={CSUB+32}:alpha='{fade(0.4)}'",
+        work_dir,"s5")
+    segs.append(s5); print("      Seg 5 ✓ — outro")
+
+    # ── SEG 6 — TAGLINE ────────────────────────────────────
+    d6   = get_dur(ffmpeg,tagline_path)+0.3
+    bg6  = make_bg(ffmpeg,valid[8:]+valid[:2],d6+0.5,work_dir,"bg6")
+    b6dk = dark_overlay(ffmpeg,bg6,work_dir,"bg6",0.65)
+    v6   = overlay_card(ffmpeg,b6dk,c_tag,90,910,work_dir,"s6_tag")
+    s6   = add_text_and_audio(ffmpeg,v6,tagline_path,
+        f"drawtext=text='Bleib neugierig':fontfile='{fb}':fontsize=40:"
+        f"fontcolor=#{GOLD}:x=(w-tw)/2:y=932:alpha='{fade()}',"
+        f"drawtext=text='Stay curious - Owl Learner':fontfile='{fr}':fontsize=24:"
+        f"fontcolor=#666688:x=(w-tw)/2:y=984:alpha='{fade(0.4)}'",
+        work_dir,"s6")
+    segs.append(s6); print("      Seg 6 ✓ — tagline")
+
+    # ── SEG 7 — COMMENT PROMPT (NEW, DYNAMIC) ──────────────
+    # Card style: purple-tinted dark with bright question text
+    # Bottom button: "Comment below"
+    # Dynamic question based on example sentence word
+    CT7    = 480
+    inner7 = CT7 + CARD_PAD_Y
+    CBTN7  = inner7 + 320
+
+    d7   = get_dur(ffmpeg,audio["comment"])
+    bg7  = make_bg(ffmpeg,valid[0:3],d7+0.5,work_dir,"bg7")
+    b7dk = dark_overlay(ffmpeg,bg7,work_dir,"bg7",0.62)
+    v7a  = overlay_card(ffmpeg,b7dk,  c_comment,    20, CT7,  work_dir,"s7_card")
+    v7b  = overlay_card(ffmpeg,v7a,   c_comment_btn,190,CBTN7,work_dir,"s7_btn")
+
+    s7 = add_text_and_audio(ffmpeg,v7b,audio["comment"],
+        # Challenge header
+        f"drawtext=text='Your Challenge':fontfile='{fb}':fontsize=36:"
+        f"fontcolor=#{PURP}:x=(w-tw)/2:y={inner7}:alpha='{fade()}',"
+        # Decorative divider with purple accent
+        f"drawbox=x=40:y={inner7+46}:w={VW-80}:h=3:color=#{PURP}@0.5:t=fill,"
+        # Dynamic question — unique per video
+        f"drawtext=text='{comment_display}':fontfile='{fb}':fontsize=38:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={inner7+62}:"
+        f"shadowcolor=#{PURP}:shadowx=0:shadowy=3:alpha='{fade(0.15)}',"
+        # Hint line
+        f"drawtext=text='Hint - check the example sentence above':fontfile='{fr}':fontsize=22:"
+        f"fontcolor=#888899:x=(w-tw)/2:y={inner7+150}:alpha='{fade(0.4)}',"
+        # Engagement line
+        f"drawtext=text='Answer in the comments':fontfile='{fm}':fontsize=26:"
+        f"fontcolor=#{TEAL}:x=(w-tw)/2:y={inner7+196}:alpha='{fade(0.5)}',"
+        # Reward line
+        f"drawtext=text='We reveal it in the next video':fontfile='{fr}':fontsize=22:"
+        f"fontcolor=#666688:x=(w-tw)/2:y={inner7+240}:alpha='{fade(0.6)}',"
+        # CTA button text
+        f"drawtext=text='COMMENT BELOW':fontfile='{fb}':fontsize=28:"
+        f"fontcolor=#ffffff:x=(w-tw)/2:y={CBTN7+28}:alpha='{fade(0.4)}'",
+        work_dir,"s7")
+    segs.append(s7); print("      Seg 7 ✓ — comment prompt")
+
+    # ── JOIN ALL 7 SEGMENTS ─────────────────────────────────
+    joined = join_segments(ffmpeg, segs, work_dir, "main")
+    print("      All 7 segments joined ✓")
+
+    # ── LOGO + MUSIC ────────────────────────────────────────
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    lp = logo_path  if os.path.isabs(logo_path)  else os.path.join(script_dir,logo_path)
+    mp = music_path if os.path.isabs(music_path) else os.path.join(script_dir,music_path)
+    has_logo  = os.path.exists(lp)
+    has_music = os.path.exists(mp)
+    print(f"      Logo: {'✓' if has_logo else '✗'} | Music: {'✓' if has_music else '✗'}")
+
+    if has_logo and has_music:
+        run_ff([ffmpeg,"-y","-i",joined,"-i",mp,"-i",lp,
+                "-filter_complex",
+                f"[2:v]scale=90:-1[logo];[0:v][logo]overlay=W-w-16:16:format=auto[vout];"
+                f"[0:a][1:a]amix=inputs=2:weights={VOICE_WEIGHT} {MUSIC_WEIGHT}:"
+                f"duration=first:normalize=0[aout]",
+                "-map","[vout]","-map","[aout]",
+                "-c:v","libx264","-crf","20","-preset","fast",
+                "-c:a","aac","-ar","44100","-b:a","192k",
+                "-movflags","+faststart",output])
+    elif has_logo:
+        run_ff([ffmpeg,"-y","-i",joined,"-i",lp,
+                "-filter_complex",
+                "[1:v]scale=90:-1[logo];[0:v][logo]overlay=W-w-16:16:format=auto[vout]",
+                "-map","[vout]","-map","0:a",
+                "-c:v","libx264","-crf","20","-preset","fast",
+                "-movflags","+faststart",output])
+    elif has_music:
+        run_ff([ffmpeg,"-y","-i",joined,"-i",mp,
+                "-filter_complex",
+                f"[0:a][1:a]amix=inputs=2:weights={VOICE_WEIGHT} {MUSIC_WEIGHT}:"
+                f"duration=first:normalize=0[aout]",
+                "-map","0:v","-map","[aout]",
+                "-c:v","libx264","-crf","20","-preset","fast",
+                "-c:a","aac","-ar","44100","-b:a","192k",
+                "-movflags","+faststart",output])
+    else:
+        run_ff([ffmpeg,"-y","-i",joined,
+                "-c:v","libx264","-crf","20","-preset","fast",
+                "-movflags","+faststart",output])
+
+    print(f"      Final video: {output}")
+    return output
+
+# ==================================================
+#   YOUTUBE UPLOAD
+# ==================================================
+
+def get_youtube_service():
+    from googleapiclient.discovery import build
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    creds=None
+    if os.path.exists(YOUTUBE_CREDS):
+        with open(YOUTUBE_CREDS,"rb") as f: creds=pickle.load(f)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow=InstalledAppFlow.from_client_secrets_file(
+                YOUTUBE_SECRETS,
+                scopes=["https://www.googleapis.com/auth/youtube.upload"])
+            creds=flow.run_local_server(port=0)
+        with open(YOUTUBE_CREDS,"wb") as f: pickle.dump(creds,f)
+    return build("youtube","v3",credentials=creds)
+
+def upload_to_youtube(data, video_path):
+    from googleapiclient.http import MediaFileUpload
+    print("[5/5] Uploading to YouTube...")
+    publish_at=(datetime.utcnow()+timedelta(hours=SCHEDULE_HOURS_AHEAD)
+               ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    youtube=get_youtube_service()
+
+    # Add comment prompt to description to drive engagement
+    comment_q = data.get("comment_prompt_display","")
+    desc = data["youtube_description"]
+    if comment_q:
+        desc += f"\n\nChallenge: {comment_q}\nWrite your answer in the comments!"
+
+    body={
+        "snippet":{"title":data["youtube_title"],"description":desc,
+                   "tags":data["tags"],"categoryId":"27","defaultLanguage":"en"},
+        "status":{"privacyStatus":"private","publishAt":publish_at,
+                  "selfDeclaredMadeForKids":False,"madeForKids":False}
+    }
+    media=MediaFileUpload(video_path,mimetype="video/mp4",resumable=True,
+                          chunksize=1024*1024*5)
+    req=youtube.videos().insert(part="snippet,status",body=body,media_body=media)
+    resp=None
+    while resp is None:
+        st,resp=req.next_chunk()
+        if st: print(f"      Upload: {int(st.progress()*100)}%")
+    vid=resp["id"]
+    print(f"      ✓ https://youtube.com/watch?v={vid}")
+    print(f"      Scheduled: {publish_at} UTC")
+    return vid
+
+# ==================================================
+#   MAIN
+# ==================================================
+
+def main():
+    print("="*58)
+    print(f"  Owl Learner v10 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("  7 segments: Hook+Intro+Word+Trans+Example+Tagline+Comment")
+    print("="*58)
+
+    if not get_ffmpeg():
+        print("ERROR: ffmpeg.exe not found."); sys.exit(1)
+    if not GROQ_API_KEY:
+        print("ERROR: Set GROQ_API_KEY at top of script."); sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ffmpeg     = get_ffmpeg()
+    work_dir   = tempfile.mkdtemp(prefix="owl_v10_")
+
+    try:
+        print("[0/5] Setting up fonts + tagline...")
+        fonts        = get_fonts(script_dir)
+        tagline_path = ensure_tagline(script_dir, ffmpeg)
+
+        data   = generate_word_data()
+        images = download_images(data["image_prompts"], work_dir)
+
+        for i,img in enumerate(images):
+            if not img or not os.path.exists(img):
+                fb=os.path.join(work_dir,f"img_{i+1}.jpg")
+                try:
+                    r=requests.get(
+                        f"https://picsum.photos/1080/1920?random={i+600}",
+                        timeout=30)
+                    with open(fb,"wb") as f: f.write(r.content)
+                    images[i]=fb
+                except: pass
+
+        audio      = generate_audio(data, work_dir, ffmpeg)
+        video_path = render_video(data, images, audio, tagline_path,
+                                  work_dir, CHANNEL_LOGO, BG_MUSIC, fonts)
+        upload_to_youtube(data, video_path)
+        save_used_word(data["german_word"])
+
+        print()
+        print("="*58)
+        print(f"  DONE! '{data['german_word']}' scheduled!")
+        print(f"  Comment prompt: {data.get('comment_prompt_display','')}")
+        print("="*58)
+
+    except Exception as e:
+        print(f"\n  ERROR: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        print("  Temp files cleaned up.")
+
+if __name__=="__main__":
+    main()
