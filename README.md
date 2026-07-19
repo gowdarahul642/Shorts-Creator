@@ -13,7 +13,6 @@ Automated pipeline to generate, render, and upload engaging **German learning Yo
   * Downloads background visuals
   * Renders high-quality vertical videos
   * Uploads directly to YouTube (scheduled)
-
 * 🧠 **Smart Content Generation**
 
   * Difficulty-based word selection (Beginner → Advanced)
