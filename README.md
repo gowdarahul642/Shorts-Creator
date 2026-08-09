@@ -3,7 +3,6 @@
 Automated pipeline to generate, render, and upload engaging **German learning YouTube Shorts** using AI-generated scripts, voice synthesis, and FFmpeg video processing.
 
 ---
-
 ## 🚀 Features
 * 🎯 **Fully Automated Workflow**
 
