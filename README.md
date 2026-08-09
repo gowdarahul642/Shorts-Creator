@@ -5,7 +5,6 @@ Automated pipeline to generate, render, and upload engaging **German learning Yo
 ---
 
 ## 🚀 Features
-
 * 🎯 **Fully Automated Workflow**
 
   * Generates German vocabulary content using AI (Groq API)
